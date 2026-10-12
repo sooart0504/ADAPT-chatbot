@@ -1,0 +1,6 @@
+# Never commit real keys.
+.streamlit/secrets.toml
+secrets.toml
+.DS_Store
+__pycache__/
+*.pyc
