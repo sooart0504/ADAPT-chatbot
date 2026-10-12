@@ -1,0 +1,18 @@
+# Keep secrets, git history, and unrelated files out of the built image.
+.git
+.gitignore
+.github
+.DS_Store
+**/.DS_Store
+.devcontainer
+
+# Real secrets must never be baked into an image. They arrive at runtime as
+# Fly secrets instead.
+.streamlit/secrets.toml
+secrets.toml
+
+# Documentation
+*.md
+
+__pycache__/
+*.pyc
