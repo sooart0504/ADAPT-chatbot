@@ -1,0 +1,171 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# HeartSteps (ADAPT RCT) chatbot — deploy to Fly.io from a button on GitHub
+# (adapted from the Future Self Formative Study's tested workflow)
+#
+# HOW TO RUN THIS
+#   GitHub.com → this repo → "Actions" tab → "Deploy to Fly.io" in the left
+#   sidebar → "Run workflow" button on the right → choose what to do → Run.
+#
+# WHY THERE IS NO AUTOMATIC DEPLOY ON PUSH
+#   This runs ONLY when you click the button. Participants use this app, and a
+#   stray commit should never change what they see. You decide when a change ships.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Deploy to Fly.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "What to do"
+        required: true
+        default: "create-app-only"
+        type: choice
+        options:
+          # Run this FIRST. Creates the empty app so it shows up in the Fly
+          # dashboard, where you then add the secrets. Deploys nothing.
+          - create-app-only
+          # Run this SECOND (and after every later change you want to ship).
+          - deploy
+
+# Never let two deploys run at the same time.
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.target }}
+    runs-on: ubuntu-latest
+
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v5
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Read the app name from fly.toml
+        run: |
+          APP=$(sed -n 's/^app *= *"\(.*\)".*/\1/p' fly.toml | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::Could not find the app name in fly.toml (the line that starts with: app = )."
+            exit 1
+          fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "App name: $APP"
+
+      # ── Preflight ───────────────────────────────────────────────────────────
+      # Checks the token before doing anything, and prints the organizations it
+      # can see. If app creation fails, that list shows the right value to use.
+      - name: Preflight — check the token and list your organizations
+        run: |
+          echo "flyctl version: $(flyctl version || true)"
+
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::error::FLY_API_TOKEN is empty."
+            echo "::error::Add it at: Settings → Secrets and variables → Actions → New repository secret."
+            echo "::error::The name must be exactly FLY_API_TOKEN."
+            exit 1
+          fi
+
+          echo "Token received: ${#FLY_API_TOKEN} characters long."
+          case "$FLY_API_TOKEN" in
+            FlyV1*)
+              echo "Token format looks correct (begins with FlyV1)." ;;
+            *)
+              echo "::warning::Your token does not begin with 'FlyV1'."
+              echo "::warning::You may have missed the start when copying. Fly shows it once —"
+              echo "::warning::if unsure, create a fresh token and re-paste the WHOLE thing." ;;
+          esac
+
+          echo ""
+          echo "─── Organizations this token can see ───"
+          if ! flyctl orgs list; then
+            echo "::error::Could not list organizations, which means the token was rejected."
+            echo "::error::Most likely causes, in order:"
+            echo "::error::  1. The token is read-only. Create a STANDARD org token, not a read-only one."
+            echo "::error::  2. Part of the token was missed when copying (it must start with 'FlyV1 ')."
+            echo "::error::  3. The token expired."
+            echo "::error::Fix: Fly dashboard → Tokens → create a new one → replace FLY_API_TOKEN on GitHub."
+            exit 1
+          fi
+          echo "───────────────────────────────────────"
+
+      - name: Create the app if it does not exist yet
+        run: |
+          # Defaults to the Fly organization used for the Future Self Formative
+          # study. To use a different one, add a repository VARIABLE named
+          # FLY_ORG (Settings → Secrets and variables → Actions → Variables tab)
+          # with the SLUG shown by the preflight step above.
+          ORG="${{ vars.FLY_ORG || 'future-selves-126872' }}"
+          echo "Organization: $ORG"
+
+          if flyctl apps list 2>/dev/null | awk '{print $1}' | grep -qx "$APP"; then
+            echo "✓ $APP already exists — leaving it alone"
+            exit 0
+          fi
+
+          echo "→ creating $APP"
+          if flyctl apps create "$APP" --org "$ORG"; then
+            echo "✓ created $APP"
+          else
+            echo "::error::Could not create $APP in organization '$ORG'."
+            echo "::error::If the error above says the NAME IS TAKEN, change the app name on the"
+            echo "::error::'app =' line of fly.toml and run this again."
+            echo "::error::Otherwise, check the organization list printed by the preflight step. If its"
+            echo "::error::SLUG column does not show '$ORG', add a repository variable FLY_ORG with"
+            echo "::error::the slug it does show (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          fi
+
+      # ── Why --ha=false and scale count 1 ────────────────────────────────────
+      # Fly defaults to TWO machines per app. Streamlit keeps a participant's
+      # conversation in memory on one machine, so if a network blip reconnects
+      # them to the other machine their session is empty and 20 minutes of
+      # conversation is gone. One machine is both safer and cheaper here.
+      - name: Deploy the chatbot
+        if: inputs.target == 'deploy'
+        run: |
+          flyctl deploy --remote-only --ha=false --config fly.toml
+          flyctl scale count 1 --yes -a "$APP"
+
+      - name: Confirm the app is running exactly one machine
+        if: inputs.target == 'deploy'
+        run: |
+          C=$(flyctl machines list -a "$APP" --json 2>/dev/null \
+                | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null \
+                || echo "?")
+          echo "$APP machine count: $C"
+          if [ "$C" != "1" ]; then
+            echo "::warning::$APP has $C machines. A participant who reconnects to a different"
+            echo "::warning::machine loses their session. Set it to 1 at: Fly dashboard → $APP → Machines."
+          fi
+
+      - name: What to do next
+        if: success() && inputs.target == 'create-app-only'
+        run: |
+          {
+            echo "## App created: \`$APP\`"
+            echo ""
+            echo "Nothing is deployed yet."
+            echo ""
+            echo "**Next:** go to fly.io/dashboard → $APP → Secrets and add the secrets"
+            echo "listed in FLY-SETUP.md. Then come back here and run this workflow"
+            echo "again with **deploy** selected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: success() && inputs.target == 'deploy'
+        run: |
+          {
+            echo "## Deploy finished"
+            echo ""
+            echo "Test link: https://$APP.fly.dev/?pid=TEST01"
+            echo ""
+            echo "If the page shows an error, a secret is probably missing or misnamed."
+            echo "Check fly.io/dashboard → $APP → Logs, then → Secrets."
+          } >> "$GITHUB_STEP_SUMMARY"
