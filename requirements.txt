@@ -1,12 +1,13 @@
-streamlit>=1.35.0
-langchain>=0.2.0
-langchain-community>=0.2.0
-langchain-classic>=0.0.1
-langchain-core>=0.2.0
-langchain-openai>=0.1.0
-langsmith>=0.1.0
-openai>=1.30.0
-gspread>=6.0.0
-google-auth>=2.29.0
-twilio>=9.0.0
-pytz>=2024.1
+# Exact versions tested together on 2026-10-12 (Python 3.11). Pinned so a
+# redeploy on Fly can't silently pull a newer LangChain/Streamlit that breaks
+# the app. To upgrade, change a version here and test before deploying.
+streamlit==1.65.0
+langchain==1.4.4
+langchain-community==0.4.2
+langchain-classic==1.0.8
+langchain-core==1.6.9
+langchain-openai==1.7.0
+langsmith==0.14.7
+openai==3.29.0
+gspread==6.2.1
+google-auth==2.61.0

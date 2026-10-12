@@ -1,20 +1,25 @@
 """
 chatbot1_app.py
-Future Self Formative Study — Chatbot 1: Ideal Future Self + Anchoring Statements
+HeartSteps (ADAPT RCT) — Future Self chatbot: Ideal Future Self narrative
 
 State machine:
   start → gen_stories → pick_persona
         → rate_story → [revise_story] → complete
 
 URL params:
-  ?pid=FSS_001
+  ?pid=<participant ID>     (required — the app will not start without it)
+
+Saves one row per completed session to the first tab of the Google Sheet
+named by GOOGLE_SHEET_KEY. See SHEET_COLUMNS below for the column order.
 """
 
 import os
 import sys
+import json
+import time
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_classic.memory import ConversationBufferMemory
@@ -22,37 +27,59 @@ from langchain_core.prompts import PromptTemplate
 from langchain_classic.chains import ConversationChain
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers.json import SimpleJsonOutputParser
-from langsmith import Client, traceable
+from langsmith import traceable
 import streamlit as st
 import streamlit.components.v1 as components
 
 from llm_config import LLMConfig
 
 
+st.set_page_config(page_title="Future Self — Part 1", page_icon="🌱")
+st.markdown("<style>[data-testid='stToolbarActions']{visibility:hidden;}</style>", unsafe_allow_html=True)
+
+
 # ── Environment ───────────────────────────────────────────────────────────────
-os.environ["OPENAI_API_KEY"]       = st.secrets["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"]  = st.secrets["OPENAI_API_KEY"]
 os.environ["OPENAI_API_BASE"] = st.secrets["OPENAI_API_BASE"]
-os.environ["LANGCHAIN_API_KEY"]    = st.secrets["LANGCHAIN_API_KEY"]
-os.environ["LANGCHAIN_PROJECT"]    = st.secrets["LANGCHAIN_PROJECT"]
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
+
+# LangSmith tracing copies every participant conversation to LangSmith's
+# servers. It is OFF by default (the Formative study turned it off too).
+# To turn it on for testing only, add the secret LANGCHAIN_TRACING = "true"
+# plus LANGCHAIN_API_KEY (and optionally LANGCHAIN_PROJECT).
+TRACING_ON = str(st.secrets.get("LANGCHAIN_TRACING", "false")).strip().lower() == "true"
+os.environ["LANGCHAIN_TRACING_V2"] = "true" if TRACING_ON else "false"
+if TRACING_ON:
+    os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
+    os.environ["LANGCHAIN_PROJECT"] = st.secrets.get("LANGCHAIN_PROJECT", "adapt-chatbot")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 input_args  = sys.argv[1:]
 config_file = input_args[0] if input_args else st.secrets.get("CONFIG_FILE_CB1", "chatbot1_config.toml")
 cfg = LLMConfig(config_file)
 
-participant_id = st.query_params.get("pid", "unknown")
-smith_client   = Client()
 
-st.set_page_config(page_title="Future Self — Part 1", page_icon="🌱")
-st.markdown("<style>[data-testid='stToolbarActions']{visibility:hidden;}</style>", unsafe_allow_html=True)
+# ── Participant ID ────────────────────────────────────────────────────────────
+# Without a PID the saved row can't be linked to anyone, so stop before the
+# participant spends 15–20 minutes on a session that would be unusable.
+participant_id = str(st.query_params.get("pid", "")).strip()
+if not participant_id:
+    st.error(
+        "This link is missing your participant ID, so we can't start yet. "
+        "Please use the exact link the study team sent you, or contact them for a new one."
+    )
+    st.stop()
+
+
+def now_utc():
+    """Timestamp with an explicit UTC offset, so it is unambiguous in the sheet."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 defaults = {
     "agentState":          "start",
     "consent":             False,
-    "created_time":        datetime.now(),
+    "created_time":        now_utc(),
     "answers_t1":          {},
     "topic1_stories":      [],
     "locked_persona":      None,
@@ -60,6 +87,7 @@ defaults = {
     "story_final":         None,
     "revision_history":    [],
     "revision_count":      0,
+    "saved":               False,
     "llm_model":           "gpt-4o",
 }
 for k, v in defaults.items():
@@ -73,42 +101,110 @@ memory_t1 = ConversationBufferMemory(memory_key="history", chat_memory=msgs_t1)
 
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
-SHEET_KEY = st.secrets.get("GOOGLE_SHEET_KEY", "YOUR_SHEET_KEY_HERE")
+SHEET_KEY = st.secrets.get("GOOGLE_SHEET_KEY", "")
 
-def save_to_sheet():
-    """Saves all Chatbot 1 outputs to Tab 1 (worksheet index 0) of the study sheet."""
+# Column order for the first tab. The first 12 columns are unchanged from the
+# earlier version; the last 4 were added so no generated data is thrown away.
+SHEET_COLUMNS = [
+    "pid",
+    "timestamp_start_utc",
+    "timestamp_end_utc",
+    "persona_selected",
+    "values",
+    "full_life",
+    "health_foundation",
+    "future_self_description",
+    "timeline",
+    "narrative_final",
+    "revision_count",
+    "chat_log",                # JSON list of {"role", "content"}
+    "story_option_1",
+    "story_option_2",
+    "story_option_3",
+    "revision_history",        # JSON list of {"round", "request", "new_story"}
+]
+
+# Google Sheets refuses any cell longer than 50,000 characters.
+MAX_CELL_CHARS = 49_000
+
+
+def cell(value):
+    """Turns a value into sheet-safe text: None becomes blank, long text is cut."""
+    text = "" if value is None else str(value)
+    if len(text) > MAX_CELL_CHARS:
+        text = text[:MAX_CELL_CHARS] + " …[TRUNCATED]"
+    return text
+
+
+def chat_log_json(messages):
+    """Readable, machine-parseable transcript (replaces the old Python repr)."""
+    return json.dumps(
+        [{"role": m.type, "content": m.content} for m in messages],
+        ensure_ascii=False,
+    )
+
+
+def get_worksheet():
     creds  = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     client = gspread.authorize(creds)
-    sheet  = client.open_by_key(SHEET_KEY).get_worksheet(0)
+    return client.open_by_key(SHEET_KEY).get_worksheet(0)
 
-    t1      = st.session_state.get("answers_t1", {})
 
-    row = [
+def build_row():
+    t1      = st.session_state.get("answers_t1", {}) or {}
+    stories = list(st.session_state.get("topic1_stories", [])) + ["", "", ""]
+
+    return [cell(v) for v in [
         participant_id,
-        str(st.session_state.get("created_time", "")),
-        str(datetime.now()),
-        str(st.session_state.get("locked_persona_name", "")),
+        st.session_state.get("created_time", ""),
+        now_utc(),
+        st.session_state.get("locked_persona_name", ""),
 
         # Topic 1 extracted answers (5 fields)
-        str(t1.get("values", "")),
-        str(t1.get("full_life", "")),
-        str(t1.get("health_foundation", "")),
-        str(t1.get("future_self_description", "")),
-        str(t1.get("timeline", "")),
+        t1.get("values"),
+        t1.get("full_life"),
+        t1.get("health_foundation"),
+        t1.get("future_self_description"),
+        t1.get("timeline"),
 
-        # Final narrative
-        str(st.session_state.get("story_final", "")),
-
-        # Revision count
-        str(st.session_state.get("revision_count", 0)),
+        # Final narrative + revision count
+        st.session_state.get("story_final", ""),
+        st.session_state.get("revision_count", 0),
 
         # Full chat log (topic 1 only)
-        str(msgs_t1.messages),
-    ]
-    sheet.append_row(row)
+        chat_log_json(msgs_t1.messages),
+
+        # The three generated versions, and every revision
+        stories[0], stories[1], stories[2],
+        json.dumps(st.session_state.get("revision_history", []), ensure_ascii=False),
+    ]]
+
+
+def save_to_sheet():
+    """Appends this session as one row to Tab 1. Writes the header row first if the tab is empty."""
+    sheet = get_worksheet()
+    if not sheet.row_values(1):
+        sheet.append_row(SHEET_COLUMNS, value_input_option="RAW")
+    # RAW: participant text is stored as typed, never interpreted as a formula.
+    sheet.append_row(build_row(), value_input_option="RAW")
+
+
+def save_with_retry(attempts=3):
+    """Google's API occasionally fails for a moment; try a few times before giving up."""
+    for attempt in range(1, attempts + 1):
+        try:
+            save_to_sheet()
+            return
+        except Exception as exc:
+            # Log the error type only, never participant content.
+            print(f"[SAVE] attempt {attempt}/{attempts} failed for pid={participant_id}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            if attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -125,7 +221,10 @@ def extract_answers(msgs, keys, extraction_template):
     """Extracts structured answers from a conversation."""
     template    = PromptTemplate(input_variables=["conversation_history"], template=extraction_template)
     chain       = template | get_llm(0.1) | SimpleJsonOutputParser()
-    return chain.invoke({"conversation_history": msgs})
+    result      = chain.invoke({"conversation_history": msgs})
+    if not isinstance(result, dict):
+        raise ValueError(f"Answer extraction returned {type(result).__name__}, expected a JSON object")
+    return result
 
 
 # ── Topic conversation runner ─────────────────────────────────────────────────
@@ -149,7 +248,15 @@ def run_topic_conversation(topic_num, msgs, memory, prompt_template, container):
 
         with container:
             st.chat_message("human").write(prompt)
-            response = conversation.invoke(input=prompt)
+            try:
+                response = conversation.invoke(input=prompt)
+            except Exception as exc:
+                # Nothing is added to the history when a call fails, so the
+                # participant can simply send the same message again.
+                print(f"[LLM] conversation call failed for pid={participant_id}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                st.warning("Sorry, I had trouble responding just now. Please send your message again.")
+                return False
 
             if "FINISHED" in response["response"]:
                 st.divider()
@@ -172,7 +279,8 @@ def generate_stories():
         msgs_t1.messages, cfg.topic1_keys, cfg.topic1_extraction_template)
 
     t1_answers  = st.session_state["answers_t1"]
-    all_answers = {k: t1_answers.get(k, "") for k in cfg.topic1_keys}
+    # Missing answers go in as blank text, not the word "None".
+    all_answers = {k: (t1_answers.get(k) or "") for k in cfg.topic1_keys}
 
     prompt_obj  = PromptTemplate.from_template(cfg.story_prompt_template)
     json_parser = SimpleJsonOutputParser()
@@ -204,8 +312,11 @@ def generate_stories():
                 "The tone, length, and voice should match the persona you have been given."
             )
         } | all_answers)
-        stories.append(result.get("output_scenario", ""))
-        progress.progress(int((i + 1) / 3 * 100), "Generating your stories...")
+        story = (result or {}).get("output_scenario", "") if isinstance(result, dict) else ""
+        if not story.strip():
+            raise ValueError(f"Story {i + 1} came back empty")
+        stories.append(story)
+        progress.progress(int((i + 1) / len(cfg.personas) * 100), "Generating your stories...")
 
     st.session_state["topic1_stories"] = stories
     st.session_state["agentState"]     = "pick_persona"
@@ -318,13 +429,20 @@ def show_revise_story():
         )
         chain = prompt_obj | get_llm(0.5) | SimpleJsonOutputParser()
 
-        with st.spinner("Revising your story..."):
-            result = chain.invoke({
-                "scenario": st.session_state["story_final"],
-                "input":    user_request
-            })
+        try:
+            with st.spinner("Revising your story..."):
+                result = chain.invoke({
+                    "scenario": st.session_state["story_final"],
+                    "input":    user_request
+                })
+        except Exception as exc:
+            print(f"[LLM] revision call failed for pid={participant_id}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            st.warning("Sorry, I couldn't revise the story just now. Please tap “Apply my request” again.")
+            return
 
-        new_story = result.get("new_scenario", st.session_state["story_final"])
+        new_story = result.get("new_scenario") if isinstance(result, dict) else None
+        new_story = new_story or st.session_state["story_final"]
         st.session_state["revision_history"].append({
             "round":     revision_count + 1,
             "request":   user_request,
@@ -359,9 +477,23 @@ def show_revise_story():
 
 # ── Completion ────────────────────────────────────────────────────────────────
 def complete_session():
-    """Saves to Google Sheets and shows completion message."""
-    with st.spinner("Saving your responses..."):
-        save_to_sheet()
+    """Saves to Google Sheets exactly once and shows completion message."""
+    # Streamlit re-runs this whole script on every click or refresh. The
+    # "saved" flag stops those re-runs from appending duplicate rows.
+    if not st.session_state.get("saved"):
+        try:
+            with st.spinner("Saving your responses..."):
+                save_with_retry()
+            st.session_state["saved"] = True
+        except Exception:
+            # Everything is still held in this browser tab, so a retry loses nothing.
+            st.error(
+                "We couldn't save your responses just yet. Please keep this tab open "
+                "and tap the button below to try again. If it still doesn't work, "
+                "let the study team know before closing this page."
+            )
+            st.button("Try saving again", key="retry_save")
+            return
 
     st.success("All done — thank you!")
     st.markdown(
@@ -386,8 +518,16 @@ def state_agent():
             st.rerun()
 
     elif state == "gen_stories":
-        with st.spinner("Creating your stories — this takes about 30 seconds..."):
-            generate_stories()
+        try:
+            with st.spinner("Creating your stories — this takes about 30 seconds..."):
+                generate_stories()
+        except Exception as exc:
+            # st.rerun() is not an Exception, so a successful run is not caught here.
+            print(f"[LLM] story generation failed for pid={participant_id}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            st.warning("Something went wrong while creating your stories. Your answers are safe. "
+                       "Please tap the button below to try again.")
+            st.button("Try again", key="retry_stories")
 
     elif state == "pick_persona":
         show_persona_picker()
@@ -410,13 +550,6 @@ def mark_consent():
 if st.session_state["consent"]:
     entry_container = st.expander("Our conversation", expanded=True)
     prompt = st.chat_input()
-
-    if not st.secrets.get("OPENAI_API_KEY"):
-        openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
-        if not openai_key:
-            st.info("Enter an OpenAI API Key to continue.")
-            st.stop()
-
     state_agent()
 
 else:

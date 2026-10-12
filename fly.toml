@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Fly.io config — HeartSteps (ADAPT RCT) Future Self chatbot
+# Deployed from GitHub: Actions tab → "Deploy to Fly.io" → Run workflow.
+# (With a terminal instead: fly deploy --ha=false)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# App names are global across all of Fly. If this one is taken, change it here
+# and nowhere else — the deploy workflow reads it from this line.
+app            = "adapt-rct-chatbot"
+primary_region = "ord"   # Chicago — closest Fly region to Michigan
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_FILE = "chatbot1_app.py"
+  PORT     = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https   = true
+
+  # IMPORTANT — do not change these three lines.
+  # Participants must be able to open the chatbot at any hour (24/7 is an IRB
+  # requirement), and a sleeping machine takes several seconds to wake. Keeping
+  # one machine always running costs a few dollars a month and removes that risk.
+  auto_stop_machines   = "off"
+  auto_start_machines  = true
+  min_machines_running = 1
+
+  # Streamlit's built-in health endpoint. Fly restarts the app if it stops answering.
+  [[http_service.checks]]
+    interval     = "30s"
+    timeout      = "5s"
+    grace_period = "30s"
+    method       = "GET"
+    path         = "/_stcore/health"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "1gb"   # Streamlit + LangChain need more than the 512mb default
